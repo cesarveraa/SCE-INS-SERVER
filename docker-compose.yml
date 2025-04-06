@@ -1,0 +1,25 @@
+version: '3.8'
+services:
+  pocketbase:
+    build:
+      context: ./pocketbase
+      dockerfile: Dockerfile
+    container_name: pocketbase_service
+    volumes:
+      - ./pocketbase/pb_data:/pb/pb_data
+    ports:
+      - "8090:8090"
+  
+  fastapi:
+    build:
+      context: ./members-service
+      dockerfile: Dockerfile
+    environment:
+      - POCKETBASE_ADMIN_EMAIL=${POCKETBASE_ADMIN_EMAIL}
+      - POCKETBASE_ADMIN_PASSWORD=${POCKETBASE_ADMIN_PASSWORD}
+      - POCKETBASE_URL=${POCKETBASE_URL}
+    container_name: fastapi_service
+    depends_on:
+      - pocketbase
+    ports:
+      - "8000:8000"

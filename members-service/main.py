@@ -1,5 +1,5 @@
-import os
 import logging
+import os
 from fastapi import FastAPI, Request
 from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,12 +8,26 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.exceptions import RequestValidationError
 
-# Importa tu router
-from app.controllers.members_controller import router as members_router
+# Importación de OpenTelemetry para Distributed Tracing
+from opentelemetry import trace
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.exporter.jaeger.thrift import JaegerExporter
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from app.utils.consul_registration import register_service, deregister_service
 
+# Importar los middlewares personalizados
+from app.middleware.correlation import CorrelationIdMiddleware
+from app.middleware.rate_limit_middleware import RateLimitMiddleware
+
+# Importa el router de members
+from app.controllers.members_controller import router as members_router
+# Importa la función para iniciar el tracer
+from app.utils.tracing import init_tracer
 app = FastAPI(
     title="Servicio de Miembros",
-    description="Microservicio para listar miembros desde PocketBase.",
+    description="Microservicio para listar (y CRUD) de miembros desde PocketBase.",
     version="1.0.0",
     contact={
         "name": "Equipo de Soporte",
@@ -24,33 +38,73 @@ app = FastAPI(
         "url": "https://opensource.org/licenses/MIT",
     },
 )
+# 1. Inicializa el tracer
+init_tracer()
 
-# Logger para reportar errores u eventos importantes
+
+# 3. Instrumenta la app con OpenTelemetry
+FastAPIInstrumentor.instrument_app(app)
+
+# 4. Registra el evento startup para registrar en consul
+# y el shutdown para desregistrar
+
+# Configuración del logger
 logger = logging.getLogger("uvicorn.error")
+@app.on_event("startup")
+async def startup_event():
+    register_service()
 
-# 1. Configuración de CORS
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["http://localhost:3000"],  # Ajusta según tu frontend
+@app.on_event("shutdown")
+async def shutdown_event():
+    deregister_service()
+
+# =========================================================
+# 1. Inicializar Tracer con OpenTelemetry (para Distributed Tracing)
+# =========================================================
+def init_tracer():
+    resource = Resource.create({"service.name": "members-service"})
+    provider = TracerProvider(resource=resource)
+    trace.set_tracer_provider(provider)
+
+    jaeger_exporter = JaegerExporter(
+        agent_host_name=os.getenv("JAEGER_HOST", "jaeger"),
+        agent_port=int(os.getenv("JAEGER_PORT", "6831")),
+    )
+    span_processor = BatchSpanProcessor(jaeger_exporter)
+    provider.add_span_processor(span_processor)
+
+init_tracer()
+
+# =========================================================
+# 2. Crear instancia de FastAPI
+# =========================================================
+
+
+# Instrumentar la app con OpenTelemetry
+FastAPIInstrumentor.instrument_app(app)
+
+# =========================================================
+# 3. Configurar Middlewares Globales
+# =========================================================
+app.add_middleware(CORSMiddleware,
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-# 2. Middleware GZip (optimiza tamaño de respuestas)
 app.add_middleware(GZipMiddleware, minimum_size=1000)
+app.add_middleware(TrustedHostMiddleware, allowed_hosts=["*"])
 
-# 3. Restricción de hosts (en producción, cámbialo a tu dominio)
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=["*"]
-)
+# Middleware personalizado de Correlation ID
+app.add_middleware(CorrelationIdMiddleware)
 
-# 4. Middleware de seguridad de headers
+# Middleware de Rate Limit para limitar solicitudes por IP
+app.add_middleware(RateLimitMiddleware, max_requests=100, window_seconds=60)
+
+# Middleware de seguridad de headers
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     response = await call_next(request)
-    # Actualizamos la política CSP para permitir recursos externos necesarios por Swagger UI
     csp = (
         "default-src 'self'; "
         "script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
@@ -59,7 +113,7 @@ async def security_headers(request: Request, call_next):
         "connect-src 'self'; "
         "frame-ancestors 'self';"
     )
-    security_headers = {
+    headers_security = {
         "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
         "Content-Security-Policy": csp,
         "X-Content-Type-Options": "nosniff",
@@ -67,38 +121,35 @@ async def security_headers(request: Request, call_next):
         "X-XSS-Protection": "1; mode=block",
         "Referrer-Policy": "strict-origin-when-cross-origin"
     }
-    response.headers.update(security_headers)
+    response.headers.update(headers_security)
     return response
 
-# 5. Manejo de errores global
+# =========================================================
+# 4. Manejadores de Excepciones Globales
+# =========================================================
 @app.exception_handler(StarletteHTTPException)
 async def http_exception_handler(request: Request, exc: StarletteHTTPException):
     logger.error(f"HTTP error: {exc.detail}")
-    return JSONResponse(
-        status_code=exc.status_code,
-        content={"detail": exc.detail},
-    )
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     logger.error(f"Validation error: {exc.errors()}")
-    return JSONResponse(
-        status_code=422,
-        content={"detail": exc.errors()},
-    )
+    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
     logger.error(f"Unhandled error: {exc}")
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Internal Server Error"},
-    )
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
 
-# 6. Registro del router
+# =========================================================
+# 5. Registro del Router de Members
+# =========================================================
 app.include_router(members_router, prefix="/members", tags=["Miembros"])
 
-# 7. Rutas de control / debug
+# =========================================================
+# 6. Endpoints de Control y Debug
+# =========================================================
 @app.get("/", include_in_schema=False)
 async def root():
     return RedirectResponse(url="/docs")
@@ -106,3 +157,4 @@ async def root():
 @app.get("/health", tags=["Monitoreo"])
 async def health_check():
     return {"status": "ok", "service": "members-service"}
+

@@ -1,5 +1,21 @@
 version: '3.8'
 services:
+  consul:
+    image: consul:1.15
+    container_name: consul
+    # Mapeo de puertos para acceder a la UI de Consul
+    ports:
+      - "8500:8500"
+    command: "agent -dev -client=0.0.0.0"
+    # OPCIONAL: volúmenes o configuración persistente
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.41
+    container_name: jaeger
+    ports:
+      - "6831:6831/udp"   # Recibir spans
+      - "16686:16686"     # Interfaz web
+
   pocketbase:
     build:
       context: ./pocketbase
@@ -9,8 +25,8 @@ services:
       - ./pocketbase/pb_data:/pb/pb_data
     ports:
       - "8090:8090"
-  
-  fastapi:
+
+  members-service:  # Cambiado de "fastapi" a "fastapi_service"
     build:
       context: ./members-service
       dockerfile: Dockerfile
@@ -18,8 +34,32 @@ services:
       - POCKETBASE_ADMIN_EMAIL=${POCKETBASE_ADMIN_EMAIL}
       - POCKETBASE_ADMIN_PASSWORD=${POCKETBASE_ADMIN_PASSWORD}
       - POCKETBASE_URL=${POCKETBASE_URL}
-    container_name: fastapi_service
+      - CONSUL_ADDRESS=http://consul:8500
+      - SERVICE_ADDRESS=members_service
+      - SERVICE_PORT=8000
+      - JAEGER_HOST=jaeger
+      - JAEGER_PORT=6831
+    container_name: members-service
     depends_on:
       - pocketbase
     ports:
       - "8000:8000"
+
+  nginx_gateway:
+    build:
+      context: ./gateway
+      dockerfile: Dockerfile
+    container_name: nginx_gateway
+    depends_on:
+      - members-service  # Cambiado de "members-service" a "fastapi_service"
+    ports:
+      - "80:80"
+  test-service:
+    build:
+      context: ./tests
+      dockerfile: Dockerfile
+    container_name: test_service
+    depends_on:
+      - members-service
+    # Este servicio se ejecuta, ejecuta los tests y finaliza.
+    restart: "no"

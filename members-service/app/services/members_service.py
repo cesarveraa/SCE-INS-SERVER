@@ -1,3 +1,5 @@
+# app/services/members_service.py
+
 import os
 import httpx
 from fastapi import HTTPException, status
@@ -6,29 +8,27 @@ POCKETBASE_URL = os.getenv("POCKETBASE_URL")
 ADMIN_EMAIL = os.getenv("POCKETBASE_ADMIN_EMAIL")
 ADMIN_PASSWORD = os.getenv("POCKETBASE_ADMIN_PASSWORD")
 
+async def _admin_auth_client(client: httpx.AsyncClient) -> dict:
+    """
+    Autentica como administrador y retorna el header con token.
+    """
+    auth_response = await client.post(
+        f"{POCKETBASE_URL}/api/admins/auth-with-password",
+        json={"identity": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
+    )
+    auth_response.raise_for_status()
+    admin_token = auth_response.json().get("token")
+    return {"Authorization": f"Bearer {admin_token}"}
+
 async def get_all_members():
     """
-    Autentica como administrador y obtiene todos los registros de la colección 'usuario'
-    junto con la relación de rol y, a partir de la tabla intermedia 'usuario_capitulo',
-    obtiene el nombre del capítulo. Retorna una lista de objetos con la siguiente información:
-    - perfil (iniciales)
-    - nombre (nombre completo)
-    - rol
-    - capitulo (nombre del capítulo)
-    - anio_ingreso (extraído del campo 'semestre_ingreso')
+    Obtiene todos los usuarios (miembros) y sus relaciones.
     """
     try:
         async with httpx.AsyncClient(timeout=10.0) as client:
-            # 1. Autenticación de administrador (ahora enviando 'identity')
-            auth_response = await client.post(
-                f"{POCKETBASE_URL}/api/admins/auth-with-password",
-                json={"identity": ADMIN_EMAIL, "password": ADMIN_PASSWORD}
-            )
-            auth_response.raise_for_status()
-            admin_token = auth_response.json().get("token")
-            headers = {"Authorization": f"Admin {admin_token}"}
-            
-            # 2. Obtener todos los usuarios expandiendo el rol
+            headers = await _admin_auth_client(client)
+
+            # Obtener todos los usuarios expandiendo el rol
             res_users = await client.get(
                 f"{POCKETBASE_URL}/api/collections/usuario/records?expand=rol",
                 headers=headers
@@ -54,7 +54,7 @@ async def get_all_members():
                 semestre = user.get("semestre_ingreso", "")
                 anio_ingreso = semestre.split("-")[-1] if "-" in semestre else semestre
 
-                # 3. Consultar la colección intermedia 'usuario_capitulo' para obtener el capítulo
+                # Consultar la colección intermedia 'usuario_capitulo' para obtener el capítulo
                 url_user_caps = (
                     f"{POCKETBASE_URL}/api/collections/usuario_capitulo/records"
                     f"?filter=(usuario='{user_id}')&expand=capitulo"
@@ -70,10 +70,9 @@ async def get_all_members():
                     cap_expanded = first_rel.get("expand", {}).get("capitulo")
                     if isinstance(cap_expanded, list) and cap_expanded:
                         cap_expanded = cap_expanded[0]
-                    # Ajusta la clave según el nombre del campo en tu colección 'capitulo'
                     capitulo_name = cap_expanded.get("capitulo", "N/A") if cap_expanded else "N/A"
 
-                # 4. Construir las iniciales a partir de nombres y apellidos
+                # Construir las iniciales a partir de nombres y apellidos
                 initials = ""
                 if nombres:
                     initials += nombres[0].upper()
@@ -111,4 +110,64 @@ async def get_all_members():
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error inesperado: {str(e)}"
+        )
+
+async def create_member(member_data: dict):
+    """
+    Crea un miembro en PocketBase.
+    `member_data` debe tener la información necesaria (p.ej.: nombres, apellidos, semestre_ingreso, etc.)
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = await _admin_auth_client(client)
+            res = await client.post(
+                f"{POCKETBASE_URL}/api/collections/usuario/records",
+                json=member_data,
+                headers=headers
+            )
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error creando el miembro: {str(e)}"
+        )
+
+async def update_member(member_id: str, member_data: dict):
+    """
+    Actualiza la información de un miembro en PocketBase.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = await _admin_auth_client(client)
+            res = await client.patch(
+                f"{POCKETBASE_URL}/api/collections/usuario/records/{member_id}",
+                json=member_data,
+                headers=headers
+            )
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error actualizando el miembro: {str(e)}"
+        )
+
+async def delete_member(member_id: str):
+    """
+    Elimina un miembro en PocketBase.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            headers = await _admin_auth_client(client)
+            res = await client.delete(
+                f"{POCKETBASE_URL}/api/collections/usuario/records/{member_id}",
+                headers=headers
+            )
+            res.raise_for_status()
+            return {"detail": "Miembro eliminado"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error eliminando el miembro: {str(e)}"
         )
